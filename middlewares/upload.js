@@ -24,16 +24,25 @@ const storage = multer.diskStorage({
     }
 });
 
+// Allowed file extensions and MIME types
+const allowedExtensions = new Set(['.jpeg', '.jpg', '.png', '.gif', '.webp', '.pdf', '.mp4', '.mov', '.avi', '.mkv', '.3gp']);
+const allowedMimeTypes = new Set([
+    'image/jpeg', 'image/jpg', 'image/png', 'image/gif', 'image/webp',
+    'video/mp4', 'video/quicktime', 'video/x-msvideo', 'video/x-matroska',
+    'video/3gpp', 'video/avi', 'video/mov',
+    'application/pdf'
+]);
+
 // File filter
 const fileFilter = (req, file, cb) => {
-    const allowedFileTypes = /jpeg|jpg|png|pdf|mp4|mov|avi|mkv/;
-    const extname = allowedFileTypes.test(path.extname(file.originalname).toLowerCase());
-    const mimetype = allowedFileTypes.test(file.mimetype);
+    const ext = path.extname(file.originalname).toLowerCase();
+    const isExtAllowed = allowedExtensions.has(ext);
+    const isMimeAllowed = allowedMimeTypes.has(file.mimetype);
 
-    if (extname || mimetype) {
+    if (isExtAllowed || isMimeAllowed) {
         return cb(null, true);
     } else {
-        cb(new Error('Only images, videos and PDFs are allowed'));
+        cb(new Error(`File type not allowed. Received: ${file.mimetype} (${ext}). Only images, videos and PDFs are supported.`));
     }
 };
 

@@ -81,14 +81,9 @@ router.get(
     caseController.getDeclinedCases
 );
 
-router.patch(
-    '/:id/accept',
-    authenticate,
-    authorize('ngo', 'shelter'),
-    checkNGOVerification,
-    validateMongoId('id'),
-    caseController.acceptCase
-);
+// NOTE: Accept case is handled exclusively by POST /:id/workflow/accept (below)
+// which uses atomic DB operations + concurrency lock.
+// The old PATCH /:id/accept route has been removed to prevent dual-route confusion.
 
 router.post(
     '/:id/decline',
@@ -98,7 +93,6 @@ router.post(
     validateMongoId('id'),
     caseController.declineCase
 );
-
 
 router.patch(
     '/:id/status',

@@ -7,6 +7,9 @@ const Notification = require('../models/Notification');
 let socketService;
 const logger = require('../utils/logger');
 
+// In-memory lock to prevent concurrent acceptances by the same NGO bypassing capacity limits
+const pendingAcceptances = new Map();
+
 // Create new case (Citizen)
 exports.createCase = async (req, res) => {
     try {
@@ -125,19 +128,23 @@ exports.createCase = async (req, res) => {
 
         logger.info(`Notifying ${targetResponders.length} ${caseType} responders in ${citizen.city}`);
 
-        // Create notification for each targeted responder
-        for (const responder of targetResponders) {
-            await Notification.create({
-                userId: responder._id,
-                userModel: 'NGO',
-                type: 'case_new',
-                title: `New ${caseType.charAt(0).toUpperCase() + caseType.slice(1)} Case`,
-                message: `A new ${condition} case (${caseType}) has been reported in ${citizen.city}`,
-                caseId: newCase._id
-            });
+        // Create notifications for all targeted responders in batch
+        const notificationsToCreate = targetResponders.map(responder => ({
+            userId: responder._id,
+            userModel: 'NGO',
+            type: 'case_new',
+            title: `New ${caseType.charAt(0).toUpperCase() + caseType.slice(1)} Case`,
+            message: `A new ${condition} case (${caseType}) has been reported in ${citizen.city}`,
+            caseId: newCase._id
+        }));
 
-            // Emit notification via socket
-            if (!socketService) socketService = require('../services/socketService');
+        if (notificationsToCreate.length > 0) {
+            await Notification.insertMany(notificationsToCreate);
+        }
+
+        // Emit notification via socket
+        if (!socketService) socketService = require('../services/socketService');
+        for (const responder of targetResponders) {
             socketService.emitNotification(responder._id, {
                 type: 'case_new',
                 title: `New ${caseType} Case`,
@@ -360,6 +367,16 @@ exports.getCaseById = async (req, res) => {
 
 // Accept case (NGO) - Atomic operation to prevent race conditions
 exports.acceptCase = async (req, res) => {
+    // Prevent NGO from double-clicking or concurrently accepting multiple cases to bypass limits
+    if (pendingAcceptances.has(req.userId)) {
+        return res.status(429).json({
+            success: false,
+            message: 'You are currently processing another acceptance. Please wait.'
+        });
+    }
+
+    pendingAcceptances.set(req.userId, true);
+
     try {
         const { id } = req.params;
 
@@ -386,6 +403,14 @@ exports.acceptCase = async (req, res) => {
             });
         }
 
+        const timelineEntry = {
+            status: 'accepted',
+            message: `Case accepted by ${ngo.organizationName}`,
+            updatedBy: req.userId,
+            refModel: 'NGO',
+            timestamp: new Date()
+        };
+
         // Atomic operation - prevents race conditions
         const caseData = await Case.findOneAndUpdate(
             {
@@ -398,6 +423,9 @@ exports.acceptCase = async (req, res) => {
                     status: 'accepted',
                     assignedNGO: req.userId,
                     acceptedAt: new Date()
+                },
+                $push: {
+                    timeline: timelineEntry
                 }
             },
             {
@@ -412,10 +440,6 @@ exports.acceptCase = async (req, res) => {
                 message: 'Case is no longer available or already accepted by another NGO'
             });
         }
-
-        // Add timeline entry
-        caseData.addTimelineEntry('accepted', `Case accepted by ${ngo.organizationName}`, req.userId, 'NGO');
-        await caseData.save();
 
         // Populate for response
         await caseData.populate('citizenId', 'name mobile city address');
@@ -448,6 +472,9 @@ exports.acceptCase = async (req, res) => {
             message: 'Failed to accept case',
             error: error.message
         });
+    } finally {
+        // Release the concurrency lock for this NGO
+        pendingAcceptances.delete(req.userId);
     }
 };
 
@@ -519,17 +546,18 @@ exports.declineCase = async (req, res) => {
             caseData.needsAdminIntervention = true;
             await caseData.save();
 
-            // Notify all admins
+            // Notify all admins in batch
             const admins = await Admin.find({ isActive: true });
-            for (const admin of admins) {
-                await Notification.create({
-                    userId: admin._id,
-                    userModel: 'Admin',
-                    type: 'system',
-                    title: 'Case Needs Intervention',
-                    message: `Case ${caseData._id} has been declined by ${caseData.declinedBy.length} NGOs in ${caseData.city}. Immediate attention required.`,
-                    caseId: caseData._id
-                });
+            const adminNotifications = admins.map(admin => ({
+                userId: admin._id,
+                userModel: 'Admin',
+                type: 'system',
+                title: 'Case Needs Intervention',
+                message: `Case ${caseData._id} has been declined by ${caseData.declinedBy.length} NGOs in ${caseData.city}. Immediate attention required.`,
+                caseId: caseData._id
+            }));
+            if (adminNotifications.length > 0) {
+                await Notification.insertMany(adminNotifications);
             }
 
             logger.warn(`Case ${id} needs admin intervention - declined by ${caseData.declinedBy.length}/${nearbyNGOs.length} NGOs`);
@@ -714,22 +742,24 @@ exports.reassignCase = async (req, res) => {
             caseData.expiryTime = new Date(Date.now() + 30 * 60 * 1000); // Reset expiry
             caseData.escalationLevel = 0; // Reset escalation
 
-            // Notify nearby NGOs
+            // Notify nearby NGOs in batch
             const nearbyNGOs = await NGO.find({
                 city: caseData.city,
                 verificationStatus: 'approved',
                 isActive: true
             });
 
-            for (const ngo of nearbyNGOs) {
-                await Notification.create({
-                    userId: ngo._id,
-                    userModel: 'NGO',
-                    type: 'case_new',
-                    title: 'Case Available Again',
-                    message: `Case ${caseData._id} is now available. Previous NGO: ${oldNGOName}`,
-                    caseId: caseData._id
-                });
+            const ngoNotifications = nearbyNGOs.map(ngo => ({
+                userId: ngo._id,
+                userModel: 'NGO',
+                type: 'case_new',
+                title: 'Case Available Again',
+                message: `Case ${caseData._id} is now available. Previous NGO: ${oldNGOName}`,
+                caseId: caseData._id
+            }));
+
+            if (ngoNotifications.length > 0) {
+                await Notification.insertMany(ngoNotifications);
             }
         }
 

@@ -135,7 +135,9 @@ const caseSchema = new mongoose.Schema({
     timeline: [{
         status: {
             type: String,
-            required: true
+            required: true,
+            enum: ['pending', 'accepted', 'reached', 'treating', 'assigned', 'in_progress',
+                'on_the_way', 'resolved', 'closed', 'rejected', 'declined', 'escalated', 'nudge']
         },
         message: {
             type: String

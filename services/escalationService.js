@@ -163,16 +163,20 @@ const notifyExpandedRadius = async (caseData, radiusKm) => {
 
         logger.info(`Notifying ${nearbyNGOs.length} NGOs within ${radiusKm}km radius`);
 
-        for (const ngo of nearbyNGOs) {
-            await Notification.create({
-                userId: ngo._id,
-                userModel: 'NGO',
-                type: 'case_new',
-                title: '⚠️ Urgent Case - Expanded Radius',
-                message: `ESCALATED: ${caseData.condition} case in ${caseData.city} needs immediate attention (${radiusKm}km radius)`,
-                caseId: caseData._id
-            });
+        const notificationsToCreate = nearbyNGOs.map(ngo => ({
+            userId: ngo._id,
+            userModel: 'NGO',
+            type: 'case_new',
+            title: '⚠️ Urgent Case - Expanded Radius',
+            message: `ESCALATED: ${caseData.condition} case in ${caseData.city} needs immediate attention (${radiusKm}km radius)`,
+            caseId: caseData._id
+        }));
 
+        if (notificationsToCreate.length > 0) {
+            await Notification.insertMany(notificationsToCreate);
+        }
+
+        for (const ngo of nearbyNGOs) {
             // Emit socket notification
             socketService.emitNotification(ngo._id, {
                 type: 'case_escalated',
@@ -202,16 +206,20 @@ const notifyStateWideNGOs = async (caseData) => {
 
         logger.info(`Notifying ${stateNGOs.length} NGOs state-wide in ${caseData.state}`);
 
-        for (const ngo of stateNGOs) {
-            await Notification.create({
-                userId: ngo._id,
-                userModel: 'NGO',
-                type: 'case_new',
-                title: '🚨 URGENT: State-Wide Alert',
-                message: `CRITICAL: ${caseData.condition} case in ${caseData.city}, ${caseData.state} needs immediate help`,
-                caseId: caseData._id
-            });
+        const alertNotifications = stateNGOs.map(ngo => ({
+            userId: ngo._id,
+            userModel: 'NGO',
+            type: 'case_new',
+            title: '🚨 URGENT: State-Wide Alert',
+            message: `CRITICAL: ${caseData.condition} case in ${caseData.city}, ${caseData.state} needs immediate help`,
+            caseId: caseData._id
+        }));
 
+        if (alertNotifications.length > 0) {
+            await Notification.insertMany(alertNotifications);
+        }
+
+        for (const ngo of stateNGOs) {
             socketService.emitNotification(ngo._id, {
                 type: 'case_critical',
                 title: '🚨 Critical Case',
@@ -233,16 +241,20 @@ const notifyAdmins = async (caseData, title, message) => {
     try {
         const admins = await Admin.find({ isActive: true });
 
-        for (const admin of admins) {
-            await Notification.create({
-                userId: admin._id,
-                userModel: 'Admin',
-                type: 'system',
-                title,
-                message,
-                caseId: caseData._id
-            });
+        const adminAlerts = admins.map(admin => ({
+            userId: admin._id,
+            userModel: 'Admin',
+            type: 'system',
+            title,
+            message,
+            caseId: caseData._id
+        }));
 
+        if (adminAlerts.length > 0) {
+            await Notification.insertMany(adminAlerts);
+        }
+
+        for (const admin of admins) {
             socketService.emitNotification(admin._id, {
                 type: 'admin_alert',
                 title,
@@ -290,6 +302,11 @@ const checkStaleActiveCases = async () => {
             logger.info(`Found ${staleCases.length} stale active cases to be processed`);
         }
 
+        // Batch notifications for all stale cases
+        const citizenNotifications = [];
+        const ngoNotifications = [];
+        const adminNotifications = [];
+
         for (const caseData of staleCases) {
             const assignedNGO = caseData.assignedNGO;
             logger.warn(`Stale case processing: ${caseData._id} assigned to ${assignedNGO?.organizationName || 'Unknown NGO'}`);
@@ -324,9 +341,9 @@ const checkStaleActiveCases = async () => {
 
             await caseData.save();
 
-            // Notify Citizen
+            // Queue notifications
             if (caseData.citizenId) {
-                await Notification.create({
+                citizenNotifications.push({
                     userId: caseData.citizenId._id,
                     userModel: 'Citizen',
                     type: 'case_update',
@@ -334,7 +351,6 @@ const checkStaleActiveCases = async () => {
                     message: `Your reported case was marked as rejected because no final progress was reported by the NGO within 24 hours. We apologize for the delay.`,
                     caseId: caseData._id
                 });
-
                 socketService.emitNotification(caseData.citizenId._id, {
                     type: 'case_rejected',
                     title: 'Case Rejected (Incomplete)',
@@ -343,9 +359,8 @@ const checkStaleActiveCases = async () => {
                 });
             }
 
-            // Notify NGO
             if (assignedNGO) {
-                await Notification.create({
+                ngoNotifications.push({
                     userId: assignedNGO._id,
                     userModel: 'NGO',
                     type: 'system',
@@ -353,7 +368,6 @@ const checkStaleActiveCases = async () => {
                     message: `Case ${caseData._id} has been auto-rejected and added to your declined history because it exceeded the 24-hour completion limit.`,
                     caseId: caseData._id
                 });
-
                 socketService.emitNotification(assignedNGO._id, {
                     type: 'case_auto_closed',
                     title: 'Time Limit Exceeded',
@@ -362,12 +376,20 @@ const checkStaleActiveCases = async () => {
                 });
             }
 
-            // Notify Admins
-            await notifyAdmins(
+            adminNotifications.push({
                 caseData,
-                'Stale Case Auto-Rejected',
-                `Case ${caseData._id} in ${caseData.city} was auto-rejected after 24h inactivity by ${assignedNGO?.organizationName || 'assigned NGO'}`
-            );
+                title: 'Stale Case Auto-Rejected',
+                message: `Case ${caseData._id} in ${caseData.city} was auto-rejected after 24h inactivity by ${assignedNGO?.organizationName || 'assigned NGO'}`
+            });
+        }
+
+        // Bulk insert all citizen + NGO notifications
+        if (citizenNotifications.length > 0) await Notification.insertMany(citizenNotifications);
+        if (ngoNotifications.length > 0) await Notification.insertMany(ngoNotifications);
+
+        // Notify admins per case (uses its own batch internally)
+        for (const { caseData, title, message } of adminNotifications) {
+            await notifyAdmins(caseData, title, message);
         }
 
     } catch (error) {
@@ -387,14 +409,20 @@ const checkFailedToAcceptCases = async () => {
         const systemAdmin = await Admin.findOne({ isActive: true });
         if (!systemAdmin) return;
 
+        // Fix: exclude cases already flagged for admin intervention (escalated at level 3)
+        // to prevent double-processing (escalation loop + this loop running on same case)
         const failedCases = await Case.find({
             status: 'pending',
-            createdAt: { $lt: failureThreshold }
+            createdAt: { $lt: failureThreshold },
+            needsAdminIntervention: false  // Skip cases already at escalation level 3
         }).populate('citizenId');
 
         if (failedCases.length > 0) {
             logger.info(`Found ${failedCases.length} pending cases not accepted for 2+ hours. Closing them.`);
         }
+
+        // Batch notifications
+        const citizenNotifs = [];
 
         for (const caseData of failedCases) {
             logger.warn(`Unaccepted case closure: ${caseData._id} - No response after 2 hours.`);
@@ -412,9 +440,9 @@ const checkFailedToAcceptCases = async () => {
 
             await caseData.save();
 
-            // Notify Citizen
+            // Queue citizen notification
             if (caseData.citizenId) {
-                await Notification.create({
+                citizenNotifs.push({
                     userId: caseData.citizenId._id,
                     userModel: 'Citizen',
                     type: 'case_update',
@@ -422,7 +450,6 @@ const checkFailedToAcceptCases = async () => {
                     message: `We're sorry, but no NGO or Shelter was available to accept your case in the last 2 hours. The case has been marked as rejected. Please try re-reporting if it's still an active emergency.`,
                     caseId: caseData._id
                 });
-
                 socketService.emitNotification(caseData.citizenId._id, {
                     type: 'case_rejected',
                     title: 'Case Rejected',
@@ -430,8 +457,15 @@ const checkFailedToAcceptCases = async () => {
                     caseId: caseData._id
                 });
             }
+        }
 
-            // Also notify admins that a case was missed
+        // Bulk insert all citizen notifications in one DB call
+        if (citizenNotifs.length > 0) {
+            await Notification.insertMany(citizenNotifs);
+        }
+
+        // Notify admins for failed cases
+        for (const caseData of failedCases) {
             await notifyAdmins(
                 caseData,
                 'Case Rejected - No Response',
@@ -482,13 +516,16 @@ const checkAcceptedButNotReached = async () => {
             reachedAt: { $exists: false }
         }).populate('assignedNGO');
 
+        // Batch nudge notifications
+        const nudgeNotifications = [];
+
         for (const caseData of stagnantCases) {
             if (caseData.assignedNGO) {
                 // Check if we already nudged them recently (prevent spam)
                 const lastNudge = caseData.timeline.filter(e => e.status === 'nudge').pop();
                 if (lastNudge && (now - new Date(lastNudge.timestamp)) < (60 * 60 * 1000)) continue;
 
-                await Notification.create({
+                nudgeNotifications.push({
                     userId: caseData.assignedNGO._id,
                     userModel: 'NGO',
                     type: 'system',
@@ -509,6 +546,11 @@ const checkAcceptedButNotReached = async () => {
 
                 logger.info(`Nudged NGO ${caseData.assignedNGO.organizationName} for stagnant case ${caseData._id}`);
             }
+        }
+
+        // Bulk insert nudge notifications
+        if (nudgeNotifications.length > 0) {
+            await Notification.insertMany(nudgeNotifications);
         }
     } catch (error) {
         logger.error('Error checking stagnant accepted cases:', error);

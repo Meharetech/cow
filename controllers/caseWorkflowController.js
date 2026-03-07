@@ -6,6 +6,9 @@ let socketService;
 const logger = require('../utils/logger');
 const mongoose = require('mongoose');
 
+// In-memory lock to prevent concurrent acceptances by the same NGO bypassing capacity limits
+const pendingAcceptances = new Map();
+
 // Enhanced nearby cases with distance calculation and pagination
 exports.getEnhancedNearbyCases = async (req, res) => {
     try {
@@ -108,6 +111,16 @@ exports.getEnhancedNearbyCases = async (req, res) => {
 
 // Accept case (atomic operation, no transactions needed)
 exports.acceptCaseWithTransaction = async (req, res) => {
+    // Prevent NGO from double-clicking or concurrently accepting multiple cases to bypass limits
+    if (pendingAcceptances.has(req.userId)) {
+        return res.status(429).json({
+            success: false,
+            message: 'You are currently processing another acceptance. Please wait.'
+        });
+    }
+
+    pendingAcceptances.set(req.userId, true);
+
     try {
         const { id } = req.params;
 
@@ -121,6 +134,46 @@ exports.acceptCaseWithTransaction = async (req, res) => {
             });
         }
 
+        // Find case to validate distance before taking any action
+        const existingCase = await Case.findById(id);
+        if (!existingCase) {
+            return res.status(404).json({
+                success: false,
+                message: 'Case not found'
+            });
+        }
+
+        if (existingCase.status !== 'pending' || existingCase.assignedNGO) {
+            return res.status(400).json({
+                success: false,
+                message: 'Case is no longer available or already accepted by another NGO'
+            });
+        }
+
+        // Validate distance (prevent accepting cases too far away) before updating
+        if (ngo.location && ngo.location.coordinates && existingCase.location) {
+            const distance = calculateDistance(
+                ngo.location.coordinates,
+                existingCase.location.coordinates
+            );
+
+            // Reject if > 100km
+            if (distance > 100000) {
+                return res.status(403).json({
+                    success: false,
+                    message: 'Case is too far from your location (max 100km)'
+                });
+            }
+        }
+
+        const timelineEntry = {
+            status: 'accepted',
+            message: 'Case accepted by NGO',
+            updatedBy: req.userId,
+            refModel: 'NGO',
+            timestamp: new Date()
+        };
+
         // Find and update case atomically (prevents race conditions)
         const caseData = await Case.findOneAndUpdate(
             {
@@ -133,6 +186,9 @@ exports.acceptCaseWithTransaction = async (req, res) => {
                     status: 'accepted',
                     assignedNGO: req.userId,
                     acceptedAt: new Date()
+                },
+                $push: {
+                    timeline: timelineEntry
                 }
             },
             {
@@ -147,32 +203,6 @@ exports.acceptCaseWithTransaction = async (req, res) => {
                 message: 'Case is no longer available or already accepted by another NGO'
             });
         }
-
-        // Optional: Validate distance (prevent accepting cases too far away)
-        if (ngo.location && ngo.location.coordinates && caseData.location) {
-            const distance = calculateDistance(
-                ngo.location.coordinates,
-                caseData.location.coordinates
-            );
-
-            // Reject if > 100km (rollback by setting back to pending)
-            if (distance > 100000) {
-                await Case.findByIdAndUpdate(id, {
-                    $set: {
-                        status: 'pending',
-                        assignedNGO: null
-                    }
-                });
-                return res.status(403).json({
-                    success: false,
-                    message: 'Case is too far from your location (max 100km)'
-                });
-            }
-        }
-
-        // Add timeline entry
-        caseData.addTimelineEntry('accepted', 'Case accepted by NGO', req.userId, 'NGO');
-        await caseData.save();
 
         // Populate for response
         await caseData.populate('citizenId', 'name mobile city address');
@@ -206,6 +236,9 @@ exports.acceptCaseWithTransaction = async (req, res) => {
             message: 'Failed to accept case',
             error: error.message
         });
+    } finally {
+        // Release the concurrency lock for this NGO
+        pendingAcceptances.delete(req.userId);
     }
 };
 

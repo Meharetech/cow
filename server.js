@@ -47,8 +47,10 @@ app.use(cors({
 }));
 
 // Body Parser Middleware
-app.use(express.json({ limit: '100mb' }));
-app.use(express.urlencoded({ extended: true, limit: '100mb' }));
+// Kept low (10mb) to prevent OOM crashes under high concurrency.
+// File uploads go through multer (streaming to disk), not JSON body.
+app.use(express.json({ limit: '10mb' }));
+app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 
 // Serve Static Files
 app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
@@ -56,16 +58,16 @@ app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 // Rate Limiting
 const limiter = rateLimit({
     windowMs: parseInt(process.env.RATE_LIMIT_WINDOW_MS) || 15 * 60 * 1000, // 15 minutes
-    max: parseInt(process.env.RATE_LIMIT_MAX_REQUESTS) || 100,
+    max: parseInt(process.env.RATE_LIMIT_MAX_REQUESTS) || 500, // Raised from 100 to handle shared NAT/corporate IPs
     message: 'Too many requests from this IP, please try again later.',
     standardHeaders: true,
     legacyHeaders: false
 });
 
-// Apply rate limiting to auth routes
+// Strict rate limiting for auth routes (prevent brute force)
 app.use('/api/auth', rateLimit({
     windowMs: 15 * 60 * 1000, // 15 minutes
-    max: 100, // Increased for development/testing
+    max: 50, // Strict limit for auth endpoints
     message: 'Too many authentication attempts, please try again later.'
 }));
 
@@ -171,14 +173,28 @@ process.on('uncaughtException', (error) => {
 
 // Start Server
 const PORT = process.env.PORT || 5000;
-server.listen(PORT, '0.0.0.0', () => {
+const HOST = process.env.HOST || '0.0.0.0';
+server.listen(PORT, HOST, () => {
+    const baseUrl = `http://localhost:${PORT}`;
+
     logger.info(`🚀 Server is running on port ${PORT}`);
     logger.info(`📡 Socket.IO is ready for real-time connections`);
     logger.info(`🌍 Environment: ${process.env.NODE_ENV}`);
     logger.info(`💾 MongoDB: Connected`);
-    console.log(`\n✅ Server is running on port ${PORT}`);
-    console.log(`✅ Real-time WebSocket ready`);
-    console.log(`✅ Ready for 10,000+ concurrent users\n`);
+
+    console.log(`\n${'='.repeat(55)}`);
+    console.log(`✅  Server running`);
+    console.log(`    Local:   ${baseUrl}`);
+    if (process.env.NGROK_URL) {
+        console.log(`    Public:  ${process.env.NGROK_URL}`);
+    }
+    console.log(`    Socket:  ws://localhost:${PORT}`);
+    console.log(`    Env:     ${process.env.NODE_ENV || 'development'}`);
+    console.log(`    Port:    ${PORT}`);
+    console.log(`${'='.repeat(55)}\n`);
+    console.log(`✅  Real-time WebSocket ready`);
+    console.log(`✅  Ready for 10,000+ concurrent users\n`);
 });
+
 
 module.exports = { app, server };
